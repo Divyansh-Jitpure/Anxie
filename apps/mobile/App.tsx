@@ -12,7 +12,9 @@ import {
   StatusBar,
   NativeModules,
   StyleSheet,
+  Alert,
 } from 'react-native';
+import * as LocalAuthentication from 'expo-local-authentication';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
   Heart,
@@ -23,6 +25,8 @@ import {
   RotateCcw,
   X,
   Plus,
+  Settings as SettingsIcon,
+  Shield,
 } from 'lucide-react-native';
 import {
   BOX_BREATHING_PHASES,
@@ -30,6 +34,8 @@ import {
   GroundingLogEntry,
   GroundingFeedbackResponse,
 } from '@anxie/shared';
+import { supabase } from './supabase';
+import BiometricGuard from './components/BiometricGuard';
 
 // ---------------------------------------------------------------------------
 // Color palette (Zinc / Teal / Emerald — same as the Tailwind config)
@@ -59,6 +65,7 @@ const C = {
   white: '#ffffff',
 };
 
+import * as SecureStore from 'expo-secure-store';
 import Constants from 'expo-constants';
 
 // ---------------------------------------------------------------------------
@@ -101,6 +108,166 @@ type ScreenState =
 // ===========================================================================
 export default function App() {
   const [screen, setScreen] = useState<ScreenState>('idle');
+
+  // Supabase Auth and User Profile State
+  const [session, setSession] = useState<any>(null);
+  const [userProfile, setUserProfile] = useState<any>(null);
+  const [isInitializingAuth, setIsInitializingAuth] = useState(true);
+
+  // Settings UI State
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [biometricEnabled, setBiometricEnabled] = useState(false);
+  const [emailInput, setEmailInput] = useState('');
+  const [passwordInput, setPasswordInput] = useState('');
+  const [isUpgrading, setIsUpgrading] = useState(false);
+  const [upgradeMessage, setUpgradeMessage] = useState('');
+
+  // Sync biometric preference when settings is opened
+  useEffect(() => {
+    if (isSettingsOpen) {
+      SecureStore.getItemAsync('anxie_biometric_lock_enabled').then(val => {
+        setBiometricEnabled(val === 'true');
+      });
+      setUpgradeMessage('');
+    }
+  }, [isSettingsOpen]);
+
+  const toggleBiometricLock = async () => {
+    try {
+      const hasHardware = await LocalAuthentication.hasHardwareAsync();
+      const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+
+      if (!hasHardware || !isEnrolled) {
+        Alert.alert(
+          'Security Setup Required',
+          'Please set up FaceID, Fingerprint, or a device passcode in your phone settings to use this feature.'
+        );
+        return;
+      }
+
+      // Prompt authentication before changing the security status
+      const result = await LocalAuthentication.authenticateAsync({
+        promptMessage: biometricEnabled
+          ? 'Authenticate to turn off App Lock'
+          : 'Authenticate to enable App Lock',
+        fallbackLabel: 'Use Passcode',
+        disableDeviceFallback: false,
+      });
+
+      if (result.success) {
+        const newVal = !biometricEnabled;
+        setBiometricEnabled(newVal);
+        await SecureStore.setItemAsync('anxie_biometric_lock_enabled', newVal ? 'true' : 'false');
+      }
+    } catch (err) {
+      console.warn('Error toggling biometric lock:', err);
+    }
+  };
+
+  const handleUpgradeAccount = async () => {
+    if (!emailInput.trim() || !passwordInput.trim()) {
+      setUpgradeMessage('Please fill in both fields.');
+      return;
+    }
+    setIsUpgrading(true);
+    setUpgradeMessage('');
+    try {
+      const { data, error } = await supabase.auth.updateUser({
+        email: emailInput.trim(),
+        password: passwordInput.trim(),
+      });
+
+      if (error) {
+        setUpgradeMessage(`Upgrade failed: ${error.message}`);
+      } else {
+        setUpgradeMessage('Account successfully created!');
+        setEmailInput('');
+        setPasswordInput('');
+        const { data: { session: updatedSession } } = await supabase.auth.getSession();
+        setSession(updatedSession);
+      }
+    } catch (err) {
+      setUpgradeMessage('Error upgrading account.');
+    } finally {
+      setIsUpgrading(false);
+    }
+  };
+
+  // ── Supabase Anonymous Auth Setup ──────────────────────────────────────
+  useEffect(() => {
+    // 1. Get initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      if (session) {
+        fetchUserProfile(session.user.id);
+      } else {
+        signInAnonymously();
+      }
+    });
+
+    // 2. Listen for auth changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      if (session) {
+        fetchUserProfile(session.user.id);
+      } else {
+        setUserProfile(null);
+        setIsInitializingAuth(false);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const signInAnonymously = async () => {
+    try {
+      const { data, error } = await supabase.auth.signInAnonymously();
+      if (error) {
+        console.warn(
+          'Anonymous sign-in failed. Please ensure "Anonymous Sign-ins" is enabled in your Supabase Auth dashboard settings.',
+          error.message
+        );
+      } else if (data.session) {
+        setSession(data.session);
+        await fetchUserProfile(data.session.user.id);
+      }
+    } catch (err) {
+      console.warn('Anonymous sign-in exception:', err);
+    } finally {
+      setIsInitializingAuth(false);
+    }
+  };
+
+  const fetchUserProfile = async (userId: string) => {
+    try {
+      let { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .single();
+
+      if (error && error.code === 'PGRST116') {
+        // Create user profile on first sign-in
+        const { data: newProfile, error: createError } = await supabase
+          .from('profiles')
+          .insert([{ id: userId, is_premium: false, free_tokens_remaining: 3 }])
+          .select()
+          .single();
+
+        if (createError) {
+          console.warn('Could not create user profile:', createError.message);
+        } else {
+          setUserProfile(newProfile);
+        }
+      } else if (data) {
+        setUserProfile(data);
+      }
+    } catch (err) {
+      console.warn('Error fetching user profile:', err);
+    } finally {
+      setIsInitializingAuth(false);
+    }
+  };
 
   // Breathing state
   const [breathingPhaseIdx, setBreathingPhaseIdx] = useState(0);
@@ -193,6 +360,28 @@ export default function App() {
     setIsLoadingFeedback(true);
     setScreen('feedback');
     setIsFallbackFeedback(false);
+
+    // Save distress log to Supabase database
+    if (session?.user) {
+      supabase
+        .from('distress_logs')
+        .insert([
+          {
+            user_id: session.user.id,
+            score_before: distressBefore,
+            score_after: distressAfter,
+            exercise_type: 'grounding',
+          },
+        ])
+        .then(({ error }) => {
+          if (error) {
+            console.warn('Failed to save distress log to database:', error.message);
+          } else {
+            console.log('Saved distress log to database successfully!');
+          }
+        });
+    }
+
     const apiUrl = getApiUrl();
     console.log('Submitting grounding to:', apiUrl);
     try {
@@ -244,7 +433,8 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={C.zinc950} />
-      <SafeAreaView style={s.safeArea}>
+      <BiometricGuard>
+        <SafeAreaView style={s.safeArea}>
         {/* ── Header ─────────────────────────────────────────────────── */}
         <View style={s.header}>
           <View style={s.headerLeft}>
@@ -253,7 +443,11 @@ export default function App() {
             </View>
             <Text style={s.headerTitle}>Anxie AI</Text>
           </View>
-          {screen !== 'idle' && (
+          {screen === 'idle' ? (
+            <TouchableOpacity onPress={() => setIsSettingsOpen(true)} style={s.closeBtn}>
+              <SettingsIcon size={16} color={C.zinc400} />
+            </TouchableOpacity>
+          ) : (
             <TouchableOpacity onPress={resetAll} style={s.closeBtn}>
               <X size={16} color={C.zinc400} />
             </TouchableOpacity>
@@ -547,7 +741,123 @@ export default function App() {
         <View style={s.footer}>
           <Text style={s.footerText}>Always safe, secure & anonymous</Text>
         </View>
-      </SafeAreaView>
+        </SafeAreaView>
+
+        {/* ── Settings Overlay ── */}
+        {isSettingsOpen && (
+          <View style={s.settingsOverlay}>
+            <SafeAreaView style={{ flex: 1 }} edges={['top', 'bottom']}>
+              <View style={s.settingsHeader}>
+              <View style={s.headerLeft}>
+                <View style={s.headerIconBox}>
+                  <SettingsIcon size={18} color={C.white} />
+                </View>
+                <Text style={s.headerTitle}>Settings</Text>
+              </View>
+              <TouchableOpacity onPress={() => setIsSettingsOpen(false)} style={s.closeBtn}>
+                <X size={16} color={C.zinc400} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView contentContainerStyle={s.settingsBody} showsVerticalScrollIndicator={false}>
+              {/* Security settings */}
+              <View style={s.settingsSection}>
+                <Text style={s.label}>Security & Privacy</Text>
+                <View style={s.settingsCard}>
+                  <View style={s.settingsRow}>
+                    <View style={{ gap: 4 }}>
+                      <Text style={s.settingsLabelText}>Biometric Lock</Text>
+                      <Text style={s.settingsDescText}>Lock app using FaceID / Fingerprint</Text>
+                    </View>
+                    <TouchableOpacity
+                      onPress={toggleBiometricLock}
+                      style={[s.toggleBtn, biometricEnabled ? s.toggleBtnOn : s.toggleBtnOff]}
+                    >
+                      <View style={[s.toggleKnob, biometricEnabled ? s.toggleKnobOn : s.toggleKnobOff]} />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              </View>
+
+              {/* Account settings */}
+              <View style={s.settingsSection}>
+                <Text style={s.label}>Account & Sync</Text>
+                <View style={s.settingsCard}>
+                  <Text style={s.settingsInfoText}>
+                    Status:{' '}
+                    <Text style={{ fontWeight: '700', color: session?.user?.is_anonymous ? C.zinc400 : C.teal400 }}>
+                      {session?.user?.is_anonymous ? 'Anonymous Guest' : 'Registered Member'}
+                    </Text>
+                  </Text>
+                  
+                  {session?.user?.email && !session.user.is_anonymous ? (
+                    <Text style={[s.settingsDescText, { marginTop: 4 }]}>
+                      Logged in as: {session.user.email}
+                    </Text>
+                  ) : (
+                    <View style={{ gap: 12, marginTop: 12 }}>
+                      <Text style={s.settingsDescText}>
+                        Upgrade your account to sync your logs and secure your entries across devices.
+                      </Text>
+                      <TextInput
+                        value={emailInput}
+                        onChangeText={setEmailInput}
+                        placeholder="Email Address"
+                        placeholderTextColor={C.zinc600}
+                        style={s.settingsInput}
+                        autoCapitalize="none"
+                        keyboardType="email-address"
+                      />
+                      <TextInput
+                        value={passwordInput}
+                        onChangeText={setPasswordInput}
+                        placeholder="Password"
+                        placeholderTextColor={C.zinc600}
+                        style={s.settingsInput}
+                        secureTextEntry
+                      />
+                      {upgradeMessage ? (
+                        <Text style={s.settingsMsgText}>{upgradeMessage}</Text>
+                      ) : null}
+                      <TouchableOpacity
+                        disabled={isUpgrading}
+                        onPress={handleUpgradeAccount}
+                        style={s.settingsActionBtn}
+                      >
+                        {isUpgrading ? (
+                          <ActivityIndicator size="small" color={C.zinc950} />
+                        ) : (
+                          <Text style={s.settingsActionBtnText}>Upgrade Account</Text>
+                        )}
+                      </TouchableOpacity>
+                    </View>
+                  )}
+                </View>
+              </View>
+
+              {/* Premium Subscriptions */}
+              <View style={s.settingsSection}>
+                <Text style={s.label}>Anxie Premium</Text>
+                <View style={[s.settingsCard, { borderColor: C.teal500_border10, backgroundColor: C.teal500_05 }]}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <Shield size={20} color={C.teal400} />
+                    <Text style={{ color: C.teal400, fontWeight: '700', fontSize: 15 }}>
+                      Unlock Anxie Premium
+                    </Text>
+                  </View>
+                  <Text style={[s.settingsDescText, { color: C.zinc300, marginTop: 8 }]}>
+                    Get unlimited AI-guided validations, advanced breathing exercises, and cognitive reframing AI journals.
+                  </Text>
+                  <TouchableOpacity style={s.premiumBtn}>
+                    <Text style={s.premiumBtnText}>View Premium Plans</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </ScrollView>
+          </SafeAreaView>
+        </View>
+      )}
+      </BiometricGuard>
     </SafeAreaProvider>
   );
 }
@@ -751,4 +1061,119 @@ const s = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
   },
   resetBtnText: { color: C.zinc300, fontWeight: '700', fontSize: 14, letterSpacing: 0.5 },
+
+  // ── Settings Styles ──────────────────────────────────────────────────────
+  settingsOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: C.zinc950,
+    paddingHorizontal: 24,
+    paddingVertical: 16,
+    zIndex: 50,
+  },
+  settingsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: C.zinc900,
+    marginBottom: 16,
+  },
+  settingsBody: {
+    gap: 24,
+    paddingBottom: 40,
+  },
+  settingsSection: {
+    gap: 8,
+  },
+  settingsCard: {
+    backgroundColor: C.zinc900,
+    borderWidth: 1,
+    borderColor: C.zinc800,
+    borderRadius: 16,
+    padding: 16,
+  },
+  settingsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  settingsLabelText: {
+    color: C.zinc100,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  settingsDescText: {
+    color: C.zinc500,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  settingsInfoText: {
+    color: C.zinc300,
+    fontSize: 13,
+  },
+  settingsInput: {
+    backgroundColor: C.zinc950,
+    borderWidth: 1,
+    borderColor: C.zinc800,
+    color: C.zinc100,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 13,
+  },
+  settingsMsgText: {
+    color: C.teal400,
+    fontSize: 11,
+    textAlign: 'center',
+    marginTop: 4,
+  },
+  settingsActionBtn: {
+    backgroundColor: C.teal400,
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  settingsActionBtnText: {
+    color: C.zinc950,
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  toggleBtn: {
+    width: 48,
+    height: 26,
+    borderRadius: 9999,
+    padding: 2,
+  },
+  toggleBtnOn: {
+    backgroundColor: C.teal500,
+  },
+  toggleBtnOff: {
+    backgroundColor: C.zinc800,
+  },
+  toggleKnob: {
+    width: 22,
+    height: 22,
+    borderRadius: 9999,
+    backgroundColor: C.zinc950,
+  },
+  toggleKnobOn: {
+    alignSelf: 'flex-end',
+  },
+  toggleKnobOff: {
+    alignSelf: 'flex-start',
+  },
+  premiumBtn: {
+    backgroundColor: C.teal500,
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 16,
+  },
+  premiumBtnText: {
+    color: C.zinc950,
+    fontWeight: '700',
+    fontSize: 13,
+  },
 });

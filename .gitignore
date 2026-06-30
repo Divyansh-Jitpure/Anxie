@@ -20,6 +20,8 @@ build/
 *.aab
 *.ipa
 *.env*.local
+.env
+.env.*
 
 # macOS/Windows
 .DS_Store
