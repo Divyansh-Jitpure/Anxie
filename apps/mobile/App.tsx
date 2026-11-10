@@ -34,6 +34,12 @@ import {
   Plus,
   Settings as SettingsIcon,
   Shield,
+  TrendingDown,
+  BarChart2,
+  Trash2,
+  ChevronLeft,
+  Calendar,
+  Activity,
 } from 'lucide-react-native';
 import {
   BOX_BREATHING_PHASES,
@@ -43,6 +49,15 @@ import {
 } from '@anxie/shared';
 import { supabase } from './supabase';
 import BiometricGuard from './components/BiometricGuard';
+
+export interface DistressLog {
+  id: string;
+  user_id: string;
+  score_before: number;
+  score_after: number;
+  exercise_type: string;
+  created_at: string;
+}
 
 // ---------------------------------------------------------------------------
 // Color palette (Zinc / Teal / Emerald — same as the Tailwind config)
@@ -108,7 +123,8 @@ type ScreenState =
   | 'grounding_distress'
   | 'grounding_steps'
   | 'grounding_final_distress'
-  | 'feedback';
+  | 'feedback'
+  | 'history';
 
 // ===========================================================================
 // App
@@ -120,6 +136,11 @@ export default function App() {
   const [session, setSession] = useState<any>(null);
   const [userProfile, setUserProfile] = useState<any>(null);
   const [isInitializingAuth, setIsInitializingAuth] = useState(true);
+
+  // Distress History State
+  const [distressLogs, setDistressLogs] = useState<DistressLog[]>([]);
+  const [isLoadingLogs, setIsLoadingLogs] = useState(false);
+  const [isClearingLogs, setIsClearingLogs] = useState(false);
 
   // Settings UI State
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -282,32 +303,125 @@ export default function App() {
 
   const fetchUserProfile = async (userId: string) => {
     try {
-      let { data, error } = await supabase
+      // 1. Try to fetch existing profile
+      const { data, error } = await supabase
         .from('profiles')
         .select('*')
         .eq('id', userId)
-        .single();
+        .maybeSingle();
 
-      if (error && error.code === 'PGRST116') {
-        // Create user profile on first sign-in
-        const { data: newProfile, error: createError } = await supabase
-          .from('profiles')
-          .insert([{ id: userId, is_premium: false, free_tokens_remaining: 3 }])
-          .select()
-          .single();
-
-        if (createError) {
-          console.warn('Could not create user profile:', createError.message);
-        } else {
-          setUserProfile(newProfile);
-        }
-      } else if (data) {
+      if (data) {
         setUserProfile(data);
+        return;
+      }
+
+      // 2. If no profile exists, create/upsert it safely without duplicate key collision
+      const { data: newProfile, error: upsertError } = await supabase
+        .from('profiles')
+        .upsert(
+          [{ id: userId, is_premium: false, free_tokens_remaining: 3 }],
+          { onConflict: 'id' }
+        )
+        .select()
+        .maybeSingle();
+
+      if (upsertError) {
+        console.warn('Could not create user profile:', upsertError.message);
+      } else if (newProfile) {
+        setUserProfile(newProfile);
       }
     } catch (err) {
       console.warn('Error fetching user profile:', err);
     } finally {
       setIsInitializingAuth(false);
+    }
+  };
+
+  // ── Distress Logs Fetching & Management ─────────────────────────────────
+  const fetchDistressLogs = async (overrideUserId?: string) => {
+    const activeUserId =
+      overrideUserId ||
+      session?.user?.id ||
+      (await supabase.auth.getSession()).data.session?.user?.id;
+
+    if (!activeUserId) return;
+    setIsLoadingLogs(true);
+    try {
+      const { data, error } = await supabase
+        .from('distress_logs')
+        .select('*')
+        .eq('user_id', activeUserId)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.warn('Error fetching distress logs:', error.message);
+      } else if (data) {
+        setDistressLogs(data);
+      }
+    } catch (err: any) {
+      console.warn('Error in fetchDistressLogs:', err);
+    } finally {
+      setIsLoadingLogs(false);
+    }
+  };
+
+  useEffect(() => {
+    if (session?.user?.id) {
+      fetchDistressLogs(session.user.id);
+    }
+  }, [session?.user?.id]);
+
+  // Re-fetch distress logs whenever user navigates to the history dashboard
+  useEffect(() => {
+    if (screen === 'history') {
+      fetchDistressLogs();
+    }
+  }, [screen]);
+
+  const handleClearHistory = () => {
+    if (!session?.user || distressLogs.length === 0) return;
+    Alert.alert(
+      'Clear Progress History',
+      'Are you sure you want to permanently clear all your saved distress exercise logs?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear All',
+          style: 'destructive',
+          onPress: async () => {
+            setIsClearingLogs(true);
+            try {
+              const { error } = await supabase
+                .from('distress_logs')
+                .delete()
+                .eq('user_id', session.user.id);
+
+              if (error) {
+                Alert.alert('Error', error.message);
+              } else {
+                setDistressLogs([]);
+              }
+            } catch (err: any) {
+              Alert.alert('Error', err.message || 'Failed to clear logs');
+            } finally {
+              setIsClearingLogs(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const formatLogDate = (isoString: string) => {
+    try {
+      const d = new Date(isoString);
+      const now = new Date();
+      const isToday = d.toDateString() === now.toDateString();
+      const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (isToday) return `Today, ${timeStr}`;
+      return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${timeStr}`;
+    } catch {
+      return 'Recent';
     }
   };
 
@@ -403,30 +517,51 @@ export default function App() {
     setScreen('feedback');
     setIsFallbackFeedback(false);
 
-    // Save distress log to Supabase database
-    if (session?.user) {
-      supabase
-        .from('distress_logs')
-        .insert([
-          {
-            user_id: session.user.id,
-            score_before: distressBefore,
-            score_after: distressAfter,
-            exercise_type: 'grounding',
-          },
-        ])
-        .then(
-          ({ error }) => {
-            if (error) {
-              console.warn('Failed to save distress log to database:', error.message);
-            } else {
-              console.log('Saved distress log to database successfully!');
-            }
-          },
-          (err: any) => {
-            console.warn('Database connection error saving distress log:', err);
+    // 1. Get active user id (from session state or directly from Supabase auth client)
+    let activeUserId = session?.user?.id;
+    if (!activeUserId) {
+      try {
+        const { data: authData } = await supabase.auth.getSession();
+        activeUserId = authData.session?.user?.id;
+        if (authData.session) setSession(authData.session);
+      } catch (authErr) {
+        console.warn('Could not retrieve active session for logging:', authErr);
+      }
+    }
+
+    // 2. Save distress log to Supabase database
+    if (activeUserId) {
+      try {
+        const { data: insertedData, error: logError } = await supabase
+          .from('distress_logs')
+          .insert([
+            {
+              user_id: activeUserId,
+              score_before: distressBefore,
+              score_after: distressAfter,
+              exercise_type: 'grounding',
+            },
+          ])
+          .select()
+          .maybeSingle();
+
+        if (logError) {
+          console.warn('Failed to save distress log to database:', logError.message);
+        } else {
+          console.log('Saved distress log to database successfully!', insertedData?.id);
+          if (insertedData) {
+            setDistressLogs(prev => [
+              insertedData,
+              ...prev.filter(l => l.id !== insertedData.id),
+            ]);
           }
-        );
+          fetchDistressLogs(activeUserId);
+        }
+      } catch (insertErr) {
+        console.warn('Exception saving distress log to database:', insertErr);
+      }
+    } else {
+      console.warn('Cannot save distress log: No authenticated user session found.');
     }
 
     const apiUrl = getApiUrl();
@@ -474,6 +609,17 @@ export default function App() {
   const activePhase = BOX_BREATHING_PHASES[breathingPhaseIdx];
   const activeStep = GROUNDING_STEPS[currentStepIdx];
 
+  // History Metrics Calculation
+  const totalSessions = distressLogs.length;
+  const totalReduction = distressLogs.reduce(
+    (acc, log) => acc + (log.score_before - log.score_after),
+    0
+  );
+  const avgReduction = totalSessions > 0 ? (totalReduction / totalSessions).toFixed(1) : '0.0';
+  const improvedSessions = distressLogs.filter(log => log.score_before > log.score_after).length;
+  const reliefRate = totalSessions > 0 ? Math.round((improvedSessions / totalSessions) * 100) : 0;
+  const chartLogs = distressLogs.slice(0, 6).reverse();
+
   // =======================================================================
   // JSX
   // =======================================================================
@@ -485,14 +631,33 @@ export default function App() {
         {/* ── Header ─────────────────────────────────────────────────── */}
         <View style={s.header}>
           <View style={s.headerLeft}>
+            {screen === 'history' ? (
+              <TouchableOpacity onPress={() => setScreen('idle')} style={{ marginRight: 6 }}>
+                <ChevronLeft size={22} color={C.zinc100} />
+              </TouchableOpacity>
+            ) : null}
             <View style={s.headerIconBox}>
               <Heart size={18} color={C.white} />
             </View>
-            <Text style={s.headerTitle}>Anxie AI</Text>
+            <Text style={s.headerTitle}>
+              {screen === 'history' ? 'Your Progress' : 'Anxie AI'}
+            </Text>
           </View>
           {screen === 'idle' ? (
             <TouchableOpacity onPress={() => setIsSettingsOpen(true)} style={s.closeBtn}>
               <SettingsIcon size={16} color={C.zinc400} />
+            </TouchableOpacity>
+          ) : screen === 'history' ? (
+            <TouchableOpacity
+              onPress={handleClearHistory}
+              disabled={isClearingLogs || distressLogs.length === 0}
+              style={[s.closeBtn, distressLogs.length === 0 && { opacity: 0.3 }]}
+            >
+              {isClearingLogs ? (
+                <ActivityIndicator size="small" color={C.zinc400} />
+              ) : (
+                <Trash2 size={16} color={C.zinc400} />
+              )}
             </TouchableOpacity>
           ) : (
             <TouchableOpacity onPress={resetAll} style={s.closeBtn}>
@@ -540,6 +705,24 @@ export default function App() {
                     <View>
                       <Text style={s.secondaryTitle}>Sensory Grounding (5-4-3-2-1)</Text>
                       <Text style={s.secondaryDesc}>Use your senses to connect to the present</Text>
+                    </View>
+                  </View>
+                  <ArrowRight size={18} color={C.zinc600} />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  onPress={() => setScreen('history')}
+                  style={s.secondaryBtn}
+                >
+                  <View style={s.secondaryBtnLeft}>
+                    <BarChart2 size={20} color={C.teal400} />
+                    <View>
+                      <Text style={s.secondaryTitle}>Your Progress & History</Text>
+                      <Text style={s.secondaryDesc}>
+                        {distressLogs.length > 0
+                          ? `${distressLogs.length} ${distressLogs.length === 1 ? 'exercise' : 'exercises'} logged • View trends`
+                          : 'Track anxiety reduction over time'}
+                      </Text>
                     </View>
                   </View>
                   <ArrowRight size={18} color={C.zinc600} />
@@ -781,6 +964,201 @@ export default function App() {
                 </View>
               )}
             </View>
+          )}
+
+          {/* ░░ HISTORY & PROGRESS DASHBOARD ░░ */}
+          {screen === 'history' && (
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={{ gap: 20, paddingVertical: 12, paddingBottom: 24 }}
+            >
+              {/* Summary Metrics */}
+              <View style={s.metricsRow}>
+                <View style={s.metricCard}>
+                  <Text style={s.metricLabel}>EXERCISES</Text>
+                  <Text style={s.metricValue}>{totalSessions}</Text>
+                  <Text style={s.metricSub}>Completed</Text>
+                </View>
+
+                <View style={s.metricCard}>
+                  <Text style={s.metricLabel}>AVG DROP</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                    <TrendingDown size={18} color={C.emerald400} />
+                    <Text style={[s.metricValue, { color: C.emerald400 }]}>
+                      {Number(avgReduction) > 0 ? `-${avgReduction}` : avgReduction}
+                    </Text>
+                  </View>
+                  <Text style={s.metricSub}>Points reduced</Text>
+                </View>
+
+                <View style={s.metricCard}>
+                  <Text style={s.metricLabel}>RELIEF RATE</Text>
+                  <Text style={[s.metricValue, { color: C.teal400 }]}>{reliefRate}%</Text>
+                  <Text style={s.metricSub}>Felt calmer</Text>
+                </View>
+              </View>
+
+              {/* Visual Comparison Chart */}
+              {chartLogs.length > 0 && (
+                <View style={s.chartCard}>
+                  <View style={s.chartHeader}>
+                    <View style={{ gap: 2 }}>
+                      <Text style={s.label}>RECENT SESSIONS</Text>
+                      <Text style={s.chartTitle}>Distress Shift Over Time</Text>
+                    </View>
+                    <View style={s.chartLegend}>
+                      <View style={s.legendItem}>
+                        <View style={[s.legendDot, { backgroundColor: '#f43f5e' }]} />
+                        <Text style={s.legendText}>Before</Text>
+                      </View>
+                      <View style={s.legendItem}>
+                        <View style={[s.legendDot, { backgroundColor: C.teal400 }]} />
+                        <Text style={s.legendText}>After</Text>
+                      </View>
+                    </View>
+                  </View>
+
+                  {/* Visual Bar Area */}
+                  <View style={s.chartPlotArea}>
+                    {chartLogs.map((log, idx) => {
+                      const beforeHeight = Math.max(14, (log.score_before / 10) * 110);
+                      const afterHeight = Math.max(14, (log.score_after / 10) * 110);
+                      return (
+                        <View key={log.id || idx} style={s.chartColumn}>
+                          <View style={s.barsWrapper}>
+                            {/* Before Bar */}
+                            <View style={s.barContainer}>
+                              <Text style={s.barValText}>{log.score_before}</Text>
+                              <View
+                                style={[
+                                  s.barView,
+                                  {
+                                    height: beforeHeight,
+                                    backgroundColor: '#f43f5e',
+                                  },
+                                ]}
+                              />
+                            </View>
+
+                            {/* After Bar */}
+                            <View style={s.barContainer}>
+                              <Text style={[s.barValText, { color: C.teal400 }]}>
+                                {log.score_after}
+                              </Text>
+                              <View
+                                style={[
+                                  s.barView,
+                                  {
+                                    height: afterHeight,
+                                    backgroundColor: C.teal400,
+                                  },
+                                ]}
+                              />
+                            </View>
+                          </View>
+                          <Text style={s.chartColLabel}>
+                            {formatLogDate(log.created_at).split(',')[0]}
+                          </Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                </View>
+              )}
+
+              {/* Activity Log Feed */}
+              <View style={{ gap: 10 }}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Text style={s.label}>SESSION HISTORY</Text>
+                  <Text style={{ fontSize: 11, color: C.zinc500 }}>
+                    {distressLogs.length} {distressLogs.length === 1 ? 'entry' : 'entries'}
+                  </Text>
+                </View>
+
+                {isLoadingLogs ? (
+                  <View style={{ paddingVertical: 32, alignItems: 'center' }}>
+                    <ActivityIndicator color={C.teal400} />
+                    <Text style={{ color: C.zinc500, fontSize: 12, marginTop: 8 }}>
+                      Loading history...
+                    </Text>
+                  </View>
+                ) : distressLogs.length === 0 ? (
+                  <View style={s.emptyHistoryCard}>
+                    <Activity size={32} color={C.zinc600} />
+                    <Text style={s.emptyHistoryTitle}>No logs recorded yet</Text>
+                    <Text style={s.emptyHistoryDesc}>
+                      Complete your first Box Breathing or Sensory Grounding exercise to track your relief progress here.
+                    </Text>
+                    <TouchableOpacity
+                      onPress={() => setScreen('grounding_distress')}
+                      style={s.emptyStartBtn}
+                    >
+                      <Text style={s.emptyStartBtnText}>Start Grounding Exercise</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  distressLogs.map(log => {
+                    const pointDiff = log.score_before - log.score_after;
+                    return (
+                      <View key={log.id} style={s.historyCard}>
+                        <View style={s.historyCardLeft}>
+                          <View style={s.historyIconBox}>
+                            {log.exercise_type === 'breathing' ? (
+                              <Wind size={18} color={C.teal400} />
+                            ) : (
+                              <Compass size={18} color={C.emerald400} />
+                            )}
+                          </View>
+                          <View style={{ gap: 2 }}>
+                            <Text style={s.historyTitle}>
+                              {log.exercise_type === 'breathing'
+                                ? 'Box Breathing'
+                                : 'Sensory Grounding'}
+                            </Text>
+                            <Text style={s.historyDate}>{formatLogDate(log.created_at)}</Text>
+                          </View>
+                        </View>
+
+                        <View style={s.historyCardRight}>
+                          <View style={s.scoreShiftRow}>
+                            <Text style={s.scoreShiftBefore}>{log.score_before}</Text>
+                            <ArrowRight size={12} color={C.zinc500} />
+                            <Text style={s.scoreShiftAfter}>{log.score_after}</Text>
+                          </View>
+                          <View
+                            style={[
+                              s.reductionPill,
+                              pointDiff > 0
+                                ? s.reductionPillPositive
+                                : pointDiff === 0
+                                ? s.reductionPillNeutral
+                                : s.reductionPillNegative,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                s.reductionPillText,
+                                pointDiff > 0
+                                  ? { color: C.emerald400 }
+                                  : pointDiff === 0
+                                  ? { color: C.zinc400 }
+                                  : { color: '#f43f5e' },
+                              ]}
+                            >
+                              {pointDiff > 0
+                                ? `-${pointDiff} pts`
+                                : pointDiff === 0
+                                ? '0 pts'
+                                : `+${Math.abs(pointDiff)} pts`}
+                            </Text>
+                          </View>
+                        </View>
+                      </View>
+                    );
+                  })
+                )}
+              </View>
+            </ScrollView>
           )}
         </KeyboardAvoidingView>
 
@@ -1246,5 +1624,218 @@ const s = StyleSheet.create({
     color: C.zinc950,
     fontWeight: '700',
     fontSize: 13,
+  },
+
+  // ── History Dashboard Styles ─────────────────────────────────────────────
+  metricsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    width: '100%',
+  },
+  metricCard: {
+    flex: 1,
+    backgroundColor: C.zinc900,
+    borderWidth: 1,
+    borderColor: C.zinc800,
+    borderRadius: 16,
+    padding: 12,
+    alignItems: 'center',
+    gap: 4,
+  },
+  metricLabel: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: C.zinc500,
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  metricValue: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: C.zinc100,
+  },
+  metricSub: {
+    fontSize: 10,
+    color: C.zinc500,
+  },
+  chartCard: {
+    backgroundColor: C.zinc900,
+    borderWidth: 1,
+    borderColor: C.zinc800,
+    borderRadius: 16,
+    padding: 16,
+    gap: 16,
+  },
+  chartHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  chartTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: C.zinc100,
+  },
+  chartLegend: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  legendItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  legendDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  legendText: {
+    fontSize: 10,
+    color: C.zinc400,
+    fontWeight: '500',
+  },
+  chartPlotArea: {
+    height: 140,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'flex-end',
+    paddingTop: 16,
+    paddingBottom: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: C.zinc800,
+  },
+  chartColumn: {
+    alignItems: 'center',
+    gap: 6,
+    flex: 1,
+  },
+  barsWrapper: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 3,
+  },
+  barContainer: {
+    alignItems: 'center',
+    gap: 2,
+  },
+  barValText: {
+    fontSize: 8,
+    fontWeight: '700',
+    color: C.zinc500,
+  },
+  barView: {
+    width: 10,
+    borderTopLeftRadius: 3,
+    borderTopRightRadius: 3,
+  },
+  chartColLabel: {
+    fontSize: 9,
+    color: C.zinc500,
+    fontWeight: '600',
+  },
+  emptyHistoryCard: {
+    backgroundColor: C.zinc900,
+    borderWidth: 1,
+    borderColor: C.zinc800,
+    borderRadius: 16,
+    padding: 28,
+    alignItems: 'center',
+    gap: 10,
+  },
+  emptyHistoryTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: C.zinc200,
+  },
+  emptyHistoryDesc: {
+    fontSize: 12,
+    color: C.zinc500,
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  emptyStartBtn: {
+    marginTop: 8,
+    backgroundColor: C.emerald500,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  emptyStartBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: C.zinc950,
+  },
+  historyCard: {
+    backgroundColor: C.zinc900,
+    borderWidth: 1,
+    borderColor: C.zinc800,
+    borderRadius: 16,
+    padding: 14,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  historyCardLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    flex: 1,
+  },
+  historyIconBox: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: C.zinc950,
+    borderWidth: 1,
+    borderColor: C.zinc800,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  historyTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: C.zinc100,
+  },
+  historyDate: {
+    fontSize: 11,
+    color: C.zinc500,
+  },
+  historyCardRight: {
+    alignItems: 'flex-end',
+    gap: 4,
+  },
+  scoreShiftRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  scoreShiftBefore: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#f43f5e',
+  },
+  scoreShiftAfter: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: C.teal400,
+  },
+  reductionPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 9999,
+  },
+  reductionPillPositive: {
+    backgroundColor: 'rgba(16,185,129,0.1)',
+  },
+  reductionPillNeutral: {
+    backgroundColor: 'rgba(113,113,122,0.1)',
+  },
+  reductionPillNegative: {
+    backgroundColor: 'rgba(244,63,94,0.1)',
+  },
+  reductionPillText: {
+    fontSize: 10,
+    fontWeight: '700',
   },
 });
