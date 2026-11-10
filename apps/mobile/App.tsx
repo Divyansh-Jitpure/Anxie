@@ -9,11 +9,18 @@ import {
   Platform,
   ActivityIndicator,
   KeyboardAvoidingView,
-  StatusBar,
   NativeModules,
   StyleSheet,
   Alert,
+  LogBox,
 } from 'react-native';
+
+LogBox.ignoreLogs([
+  'Unable to resolve host',
+  'AuthRetryableFetchError',
+  'fetch failed',
+]);
+import { StatusBar } from 'expo-status-bar';
 import * as LocalAuthentication from 'expo-local-authentication';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
@@ -121,6 +128,7 @@ export default function App() {
   const [passwordInput, setPasswordInput] = useState('');
   const [isUpgrading, setIsUpgrading] = useState(false);
   const [upgradeMessage, setUpgradeMessage] = useState('');
+  const [authMode, setAuthMode] = useState<'upgrade' | 'login'>('upgrade');
 
   // Sync biometric preference when settings is opened
   useEffect(() => {
@@ -193,17 +201,51 @@ export default function App() {
     }
   };
 
+  const handleLogin = async () => {
+    if (!emailInput.trim() || !passwordInput.trim()) {
+      setUpgradeMessage('Please fill in both fields.');
+      return;
+    }
+    setIsUpgrading(true);
+    setUpgradeMessage('');
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: emailInput.trim(),
+        password: passwordInput.trim(),
+      });
+
+      if (error) {
+        setUpgradeMessage(`Login failed: ${error.message}`);
+      } else {
+        setUpgradeMessage('Logged in successfully!');
+        setEmailInput('');
+        setPasswordInput('');
+        setSession(data.session);
+      }
+    } catch (err) {
+      setUpgradeMessage('Error logging in.');
+    } finally {
+      setIsUpgrading(false);
+    }
+  };
+
   // ── Supabase Anonymous Auth Setup ──────────────────────────────────────
   useEffect(() => {
     // 1. Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      if (session) {
-        fetchUserProfile(session.user.id);
-      } else {
-        signInAnonymously();
-      }
-    });
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
+        setSession(session);
+        if (session) {
+          fetchUserProfile(session.user.id);
+        } else {
+          signInAnonymously();
+        }
+      })
+      .catch(err => {
+        console.warn('Initial Supabase session fetch failed (project may be paused or offline):', err);
+        setIsInitializingAuth(false);
+      });
 
     // 2. Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -373,13 +415,18 @@ export default function App() {
             exercise_type: 'grounding',
           },
         ])
-        .then(({ error }) => {
-          if (error) {
-            console.warn('Failed to save distress log to database:', error.message);
-          } else {
-            console.log('Saved distress log to database successfully!');
+        .then(
+          ({ error }) => {
+            if (error) {
+              console.warn('Failed to save distress log to database:', error.message);
+            } else {
+              console.log('Saved distress log to database successfully!');
+            }
+          },
+          (err: any) => {
+            console.warn('Database connection error saving distress log:', err);
           }
-        });
+        );
     }
 
     const apiUrl = getApiUrl();
@@ -432,7 +479,7 @@ export default function App() {
   // =======================================================================
   return (
     <SafeAreaProvider>
-      <StatusBar barStyle="light-content" backgroundColor={C.zinc950} />
+      <StatusBar style="light" />
       <BiometricGuard>
         <SafeAreaView style={s.safeArea}>
         {/* ── Header ─────────────────────────────────────────────────── */}
@@ -796,9 +843,26 @@ export default function App() {
                     </Text>
                   ) : (
                     <View style={{ gap: 12, marginTop: 12 }}>
+                      {/* Tabs */}
+                      <View style={{ flexDirection: 'row', gap: 16, borderBottomWidth: 1, borderBottomColor: C.zinc800, paddingBottom: 6 }}>
+                        <TouchableOpacity onPress={() => { setAuthMode('upgrade'); setUpgradeMessage(''); }}>
+                          <Text style={{ color: authMode === 'upgrade' ? C.teal400 : C.zinc500, fontSize: 12, fontWeight: '700' }}>
+                            UPGRADE GUEST
+                          </Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity onPress={() => { setAuthMode('login'); setUpgradeMessage(''); }}>
+                          <Text style={{ color: authMode === 'login' ? C.teal400 : C.zinc500, fontSize: 12, fontWeight: '700' }}>
+                            SIGN IN
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+
                       <Text style={s.settingsDescText}>
-                        Upgrade your account to sync your logs and secure your entries across devices.
+                        {authMode === 'upgrade'
+                          ? 'Upgrade your guest account to permanent email status. Requires email verification.'
+                          : 'Sign in with your verified email and password.'}
                       </Text>
+                      
                       <TextInput
                         value={emailInput}
                         onChangeText={setEmailInput}
@@ -819,15 +883,18 @@ export default function App() {
                       {upgradeMessage ? (
                         <Text style={s.settingsMsgText}>{upgradeMessage}</Text>
                       ) : null}
+                      
                       <TouchableOpacity
                         disabled={isUpgrading}
-                        onPress={handleUpgradeAccount}
+                        onPress={authMode === 'upgrade' ? handleUpgradeAccount : handleLogin}
                         style={s.settingsActionBtn}
                       >
                         {isUpgrading ? (
                           <ActivityIndicator size="small" color={C.zinc950} />
                         ) : (
-                          <Text style={s.settingsActionBtnText}>Upgrade Account</Text>
+                          <Text style={s.settingsActionBtnText}>
+                            {authMode === 'upgrade' ? 'Upgrade Account' : 'Sign In'}
+                          </Text>
                         )}
                       </TouchableOpacity>
                     </View>
@@ -1064,7 +1131,11 @@ const s = StyleSheet.create({
 
   // ── Settings Styles ──────────────────────────────────────────────────────
   settingsOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
     backgroundColor: C.zinc950,
     paddingHorizontal: 24,
     paddingVertical: 16,
